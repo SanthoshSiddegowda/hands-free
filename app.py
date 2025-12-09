@@ -3,8 +3,22 @@ Simple FastRTC Audio Echo App with API Streaming Support
 This app transcribes audio, sends transcription via API, and responds with TTS audio.
 """
 
+import os
 import numpy as np
 from fastrtc import Stream, ReplyOnPause, get_stt_model, KokoroTTSOptions, get_tts_model, AdditionalOutputs
+from google import genai
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Initialize Google Generative AI client (only if API key is available)
+gemini_api_key = os.getenv('GEMINI_API_KEY')
+if gemini_api_key:
+    client = genai.Client(api_key=gemini_api_key)
+else:
+    client = None
+    print("Warning: GEMINI_API_KEY not set. Gemini integration will be disabled.")
 
 # Initialize the speech-to-text model
 stt_model = get_stt_model(model="moonshine/base")
@@ -44,15 +58,49 @@ def echo(audio: tuple[int, np.ndarray], webrtc_id: str = None):
         yield (sample_rate, silence)
         return
 
-    # Generate TTS audio from transcribed text
-    tts_options = KokoroTTSOptions(
-        voice="af_heart",
-        speed=1.0,
-        lang="en-us"
-    )
-    
+    # Generate response using Google Gemini (if available)
+    if client:
+        try:
+            # System prompt for Bizom voice assistant
+            system_prompt = """
+            You are Bizom voice assistant.
+            Bizom salespeople use you to get quick answers.
+            Always respond in short and sweet answers. Be concise and helpful.
+            """
+            
+            # Combine system prompt with user query
+            prompt = f"{system_prompt}\n\nUser: {text}\nAssistant:"
+            
+            response = client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents=prompt,
+                config=genai.types.GenerateContentConfig(
+                    temperature=0,
+                    top_p=0.95,
+                    top_k=20,
+                ),
+            )
+
+            response_text = response.text
+            print(f"Gemini response: {response_text}")
+        except Exception as e:
+            print(f"Error calling Gemini API: {e}")
+            # Fallback to using transcribed text directly
+            response_text = text
+    else:
+        # If Gemini is not available, use transcribed text directly
+        response_text = text
+        print(f"Using transcribed text directly (Gemini not available): {response_text}")
+
+    # Generate TTS audio from response text
     try:
-        tts_audio = tts_model.tts(text, options=tts_options)
+        tts_options = KokoroTTSOptions(
+            voice="af_heart",
+            speed=1.0,
+            lang="en-us"
+        )
+        
+        tts_audio = tts_model.tts(response_text, options=tts_options)
         tts_sample_rate, tts_audio_array = tts_audio
         # Yield the TTS audio response
         yield (tts_sample_rate, tts_audio_array)
@@ -80,7 +128,7 @@ if __name__ == "__main__":
     stream.ui.launch(
         server_name="0.0.0.0",  # Accept connections from network (required for API)
         server_port=7860,       # Default Gradio port
-        share=True             # Set to True if you want a public URL
+        share=False             # Set to True if you want a public URL
     )
 
 

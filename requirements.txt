@@ -1,2 +1,3 @@
-fastrtc[stt]
-
+fastrtc[vad, stt, tts]
+google-genai
+python-dotenv
