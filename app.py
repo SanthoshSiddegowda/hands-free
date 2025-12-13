@@ -1,184 +1,161 @@
 """
-Simple FastRTC Audio Echo App with API Streaming Support
-This app uses Shuka-1 for audio-to-text processing in Indian languages and responds with TTS audio.
+Simple FastRTC Audio Live Streaming App
+This app receives audio from WebRTC connections and streams it back in real-time (echo).
 """
 
-import os
+from fastapi import FastAPI
 import numpy as np
-from fastrtc import Stream, ReplyOnPause, KokoroTTSOptions, get_tts_model, AdditionalOutputs
-from dotenv import load_dotenv
-import transformers
-import torch
-
-# Load environment variables from .env file
-load_dotenv()
-
-# Initialize Shuka-1 model (Audio-to-Text model for Indian languages)
-# Shuka-1 supports: Bengali, English, Gujarati, Hindi, Kannada, Malayalam, 
-# Marathi, Oriya, Punjabi, Tamil, and Telugu
-# Works offline after first model download
-print("Loading Shuka-1 model... This may take a few minutes on first run.")
-try:
-    device = 0 if torch.cuda.is_available() else -1  # Use GPU if available, else CPU
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    
-    shuka_pipe = transformers.pipeline(
-        model='sarvamai/shuka-1',
-        trust_remote_code=True,
-        device=device,
-        torch_dtype=dtype
-    )
-    print(f"Shuka-1 model loaded successfully on {'GPU' if device >= 0 else 'CPU'}")
-except Exception as e:
-    print(f"Error loading Shuka-1 model: {e}")
-    print("Falling back to basic functionality")
-    shuka_pipe = None
-
-# Initialize the text-to-speech model
-tts_model = get_tts_model(model="kokoro")
+from fastrtc import Stream, StreamHandler, get_cloudflare_turn_credentials_async, get_stt_model
+from gradio.utils import get_space
+from collections import deque
+import time
 
 
-def echo(audio: tuple[int, np.ndarray], webrtc_id: str = None):
+class AudioLiveStreamHandler(StreamHandler):
     """
-    Echo handler that processes audio with Shuka-1, sends response via API, and responds with TTS.
-    
-    Args:
-        audio: Tuple of (sample_rate, numpy array of audio)
-        webrtc_id: The WebRTC connection ID (provided by fastrtc for API streaming)
-    
-    Yields:
-        AdditionalOutputs for response text, then audio chunks as tuples of (sample_rate, numpy audio array)
+    Handler that receives audio and streams it back in real-time (echo).
     """
-    sample_rate, audio_array = audio
-
-    # Process audio with Shuka-1 (audio-to-text model for Indian languages)
-    if shuka_pipe:
-        try:
-            # Ensure audio is in the correct format (float32, mono)
-            if audio_array.dtype != np.float32:
-                audio_array = audio_array.astype(np.float32)
-            
-            # Normalize audio if needed
-            if np.max(np.abs(audio_array)) > 1.0:
-                audio_array = audio_array / np.max(np.abs(audio_array))
-            
-            # Shuka-1 system prompt for Bizom voice assistant
-            turns = [
-                {
-                    'role': 'system', 
-                    'content': 'You are Bizom voice assistant. Bizom Salesman use you to get quick answers. Always respond in short and sweet answers. Be concise and helpful. IMPORTANT: Respond in the SAME LANGUAGE as the user\'s query. Support all Indian languages: Hindi, Tamil, Telugu, Bengali, Marathi, Gujarati, Malayalam, Kannada, Urdu, Punjabi, and English.'
-                },
-                {
-                    'role': 'user', 
-                    'content': '<|audio|>'
-                }
-            ]
-            
-            # Process audio with Shuka-1
-            result = shuka_pipe(
-                {
-                    'audio': audio_array,
-                    'turns': turns,
-                    'sampling_rate': sample_rate
-                },
-                max_new_tokens=512
-            )
-            
-            # Extract response text from result
-            if isinstance(result, dict):
-                response_text = result.get('generated_text', '') or result.get('text', '')
-            elif isinstance(result, str):
-                response_text = result
-            elif isinstance(result, list) and len(result) > 0:
-                response_text = result[0].get('generated_text', '') if isinstance(result[0], dict) else str(result[0])
-            else:
-                response_text = str(result)
-            
-            # Clean up response text
-            response_text = response_text.strip()
-            print(f"Shuka-1 response: {response_text}")
-            
-            # Send response back to client via AdditionalOutputs (API streaming)
-            # The client will receive: {"type": "fetch_output", "data": "<response_text>"}
-            yield AdditionalOutputs(response_text if response_text else "")
-            
-            # Skip TTS if response is empty
-            if not response_text:
-                silence_duration = 0.5  # seconds
-                silence_samples = int(sample_rate * silence_duration)
-                silence = np.zeros(silence_samples, dtype=np.float32)
-                yield (sample_rate, silence)
-                return
-            
-            # Generate TTS audio from response text
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sample_rate = 48000  # Default, will be updated from first frame
+        self.frame_count = 0
+        self.last_log_time = time.time()
+        # Queue for audio frames to be streamed back
+        self.output_queue = deque(maxlen=10)  # Keep last 10 frames to prevent overflow
+        # Initialize speech-to-text model
+        self.stt_model = get_stt_model(model="moonshine/base")
+        # Buffer to accumulate audio for transcription
+        self.audio_buffer = []
+        self.buffer_duration = 2.0  # Transcribe every 2 seconds of audio
+        self.buffer_samples = 0
+        
+    def receive(self, frame: tuple[int, np.ndarray]):
+        """
+        Process incoming audio frames and queue them for streaming back.
+        Also transcribes the audio using speech-to-text.
+        
+        Args:
+            frame: Tuple of (sample_rate, numpy array of audio)
+        """
+        sample_rate, audio_array = frame
+        self.sample_rate = sample_rate
+        self.frame_count += 1
+        
+        # Log first few frames for debugging
+        if self.frame_count <= 3:
+            print(f"Received audio frame #{self.frame_count}: sample_rate={sample_rate}, samples={len(audio_array)}, dtype={audio_array.dtype}")
+        
+        # Accumulate audio for transcription
+        audio_copy = audio_array.copy() if hasattr(audio_array, 'copy') else audio_array
+        self.audio_buffer.append(audio_copy)
+        self.buffer_samples += audio_array.shape[-1] if len(audio_array.shape) > 1 else len(audio_array)
+        
+        # Transcribe when we have enough audio (every ~2 seconds)
+        samples_per_second = sample_rate
+        if self.buffer_samples >= samples_per_second * self.buffer_duration:
+            # Concatenate all buffered audio
+            if len(self.audio_buffer) > 0:
+                # Handle different array shapes
+                if len(self.audio_buffer[0].shape) == 1:
+                    accumulated_audio = np.concatenate(self.audio_buffer)
+                else:
+                    accumulated_audio = np.concatenate(self.audio_buffer, axis=-1)
+                
+                # Ensure correct shape: (1, num_samples)
+                if len(accumulated_audio.shape) == 1:
+                    accumulated_audio = accumulated_audio.reshape(1, -1)
+                
+                # Transcribe the accumulated audio
+                try:
+                    transcription = self.stt_model.stt((sample_rate, accumulated_audio))
+                    if transcription and transcription.strip():
+                        print(f"[Transcription]: {transcription}")
+                except Exception as e:
+                    print(f"Transcription error: {e}")
+                
+                # Clear buffer
+                self.audio_buffer = []
+                self.buffer_samples = 0
+        
+        # Log periodically (every 5 seconds)
+        current_time = time.time()
+        if current_time - self.last_log_time >= 5.0:
+            print(f"Live streaming: {self.frame_count} frames received, {len(self.output_queue)} in queue")
+            self.last_log_time = current_time
+        
+        # Add frame to output queue for immediate echo back
+        self.output_queue.append((sample_rate, audio_copy))
+    
+    def emit(self):
+        """
+        Emit audio frames for live streaming (echo back).
+        
+        Returns:
+            Audio frame tuple (sample_rate, numpy array) or None
+        """
+        # Echo back frames from the queue
+        if self.output_queue:
+            return self.output_queue.popleft()
+        return None
+    
+    def shutdown(self):
+        """Transcribe any remaining buffered audio when stream ends."""
+        if self.audio_buffer and self.buffer_samples > 0:
             try:
-                # Detect language from response (simple heuristic)
-                # For Indian languages, try Hindi TTS, fallback to English
-                has_indian_script = any([
-                    '\u0900' <= char <= '\u097F' for char in response_text  # Devanagari
-                ]) or any([
-                    '\u0B80' <= char <= '\u0BFF' for char in response_text  # Tamil
-                ]) or any([
-                    '\u0C00' <= char <= '\u0C7F' for char in response_text  # Telugu/Kannada
-                ])
+                # Concatenate remaining audio
+                if len(self.audio_buffer[0].shape) == 1:
+                    accumulated_audio = np.concatenate(self.audio_buffer)
+                else:
+                    accumulated_audio = np.concatenate(self.audio_buffer, axis=-1)
                 
-                tts_lang = 'hi' if has_indian_script else 'en-us'
+                # Ensure correct shape: (1, num_samples)
+                if len(accumulated_audio.shape) == 1:
+                    accumulated_audio = accumulated_audio.reshape(1, -1)
                 
-                tts_options = KokoroTTSOptions(
-                    voice="af_bella",
-                    speed=1.0,
-                    lang=tts_lang
-                )
-                
-                tts_audio = tts_model.tts(response_text, options=tts_options)
-                tts_sample_rate, tts_audio_array = tts_audio
-                # Yield the TTS audio response
-                yield (tts_sample_rate, tts_audio_array)
+                # Transcribe remaining audio
+                transcription = self.stt_model.stt((self.sample_rate, accumulated_audio))
+                if transcription and transcription.strip():
+                    print(f"[Final Transcription]: {transcription}")
             except Exception as e:
-                print(f"Error in TTS: {e}")
-                # Fallback: yield silence on TTS error
-                silence_duration = 0.5  # seconds
-                silence_samples = int(sample_rate * silence_duration)
-                silence = np.zeros(silence_samples, dtype=np.float32)
-                yield (sample_rate, silence)
-                
-        except Exception as e:
-            print(f"Error processing audio with Shuka-1: {e}")
-            import traceback
-            traceback.print_exc()
-            # Fallback: yield silence
-            yield AdditionalOutputs("")
-            silence_duration = 0.5  # seconds
-            silence_samples = int(sample_rate * silence_duration)
-            silence = np.zeros(silence_samples, dtype=np.float32)
-            yield (sample_rate, silence)
-    else:
-        # Fallback if Shuka-1 is not loaded
-        print("Shuka-1 model not available")
-        yield AdditionalOutputs("")
-        silence_duration = 0.5  # seconds
-        silence_samples = int(sample_rate * silence_duration)
-        silence = np.zeros(silence_samples, dtype=np.float32)
-        yield (sample_rate, silence)
+                print(f"Final transcription error: {e}")
+    
+    def copy(self):
+        """Create a copy of this handler for a new connection."""
+        # Create a new instance with default parameters
+        # Each connection gets its own handler instance
+        return AudioLiveStreamHandler()
 
 
-# Create the stream with ReplyOnPause handler
+# Create the stream with live streaming handler
 stream = Stream(
-    handler=ReplyOnPause(echo),
+    handler=AudioLiveStreamHandler(),
     modality="audio",
     mode="send-receive",
-    ui_args={"title": "Bizom Assist"}
+    rtc_configuration=get_cloudflare_turn_credentials_async if get_space() else None,
+    concurrency_limit=5 if get_space() else None,
+    time_limit=90 if get_space() else None,
 )
+
+app = FastAPI()
+stream.mount(app)
+
+
+@app.get("/")
+async def index():
+    """Return server status."""
+    return {"status": "running", "endpoint": "/webrtc/offer"}
 
 
 if __name__ == "__main__":
-    # Launch the Gradio interface with network access for API clients
-    # This enables API streaming from external clients (e.g., Android app)
-    stream.ui.launch(
-        server_name="0.0.0.0",  # Accept connections from network (required for API)
-        server_port=7860,       # Default Gradio port
-        share=False             # Set to True if you want a public URL
-    )
-
-
-
+    from pyngrok import ngrok
+     
+    port = 7860
+    public_url = ngrok.connect(port)
+    print(f"Public URL: {public_url}")
+    
+    try:
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    except KeyboardInterrupt:
+        ngrok.kill()

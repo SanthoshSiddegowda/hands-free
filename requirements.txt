@@ -1,6 +1,2 @@
-fastrtc[vad, tts]
-transformers>=4.41.2
-peft>=0.11.1
-librosa>=0.10.2
-torch
-python-dotenv
+fastrtc[stt]
+pyngrok
