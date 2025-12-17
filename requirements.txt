@@ -1,2 +1,8 @@
 fastrtc[stt]
 pyngrok
+transformers>=4.35.0
+torch>=2.0.0
+scipy>=1.10.0
+huggingface_hub>=0.20.0
+timm>=0.9.0
+python-dotenv>=1.0.0
