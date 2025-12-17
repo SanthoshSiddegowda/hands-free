@@ -159,3 +159,5 @@ Thumbs.db
 *.avi
 *.mov
 
+ngrok.yml
+.gradio/
